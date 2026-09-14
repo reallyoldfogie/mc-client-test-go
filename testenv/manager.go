@@ -33,6 +33,30 @@ type ServerConfig struct {
 	PullImage  bool              // if true, always pull image before start
 	NamePrefix string            // container name prefix, e.g. "mc-test-"
 	MountDirs  []string          // mount directories (will be mounted to /data/<val>)
+
+	// HostServerPort/HostRCONPort, if non-zero, bind the container's
+	// 25565/tcp and 25575/tcp ports to these exact host ports instead of
+	// letting Docker choose a random free one (the default, zero-value
+	// behavior — unchanged for every existing caller that doesn't set
+	// these). Useful for a caller that wants a server it can find again
+	// at a predictable, fixed address on a later run (e.g. "is a server
+	// already up at this host:port; if not, start one there") rather
+	// than a purely disposable, per-run instance. Start returns an error
+	// if the requested port is already bound by something else — which
+	// is the expected outcome when it's genuinely in use, not a bug to
+	// route around here.
+	HostServerPort int
+	HostRCONPort   int
+
+	// RCONPassword, if non-empty, is used as-is instead of generating a
+	// random one. Needed for the same "find it again later" use case
+	// HostServerPort/HostRCONPort serve: a caller that only ever
+	// discovers a pre-existing server (never calls Start for it) still
+	// needs to know its RCON password in advance, which only works if
+	// whoever *did* start it was told to use a specific, known password
+	// rather than one generated fresh each time. Empty (the default)
+	// preserves today's random-generation behavior exactly.
+	RCONPassword string
 }
 
 // Instance describes a running server container instance.
@@ -85,9 +109,13 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 		}
 	}
 
-	rconPassword, err := randomHex(16)
-	if err != nil {
-		return nil, fmt.Errorf("generate RCON password: %w", err)
+	rconPassword := cfg.RCONPassword
+	if rconPassword == "" {
+		generated, err := randomHex(16)
+		if err != nil {
+			return nil, fmt.Errorf("generate RCON password: %w", err)
+		}
+		rconPassword = generated
 	}
 
 	env := []string{
@@ -125,12 +153,21 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 		return nil, err
 	}
 
+	serverHostPort := ""
+	if cfg.HostServerPort != 0 {
+		serverHostPort = strconv.Itoa(cfg.HostServerPort)
+	}
+	rconHostPort := ""
+	if cfg.HostRCONPort != 0 {
+		rconHostPort = strconv.Itoa(cfg.HostRCONPort)
+	}
+
 	portBindings := network.PortMap{
 		serverPort: []network.PortBinding{
-			{HostIP: allHostIP, HostPort: ""},
+			{HostIP: allHostIP, HostPort: serverHostPort},
 		},
 		rconPort: []network.PortBinding{
-			{HostIP: localHostIP, HostPort: ""},
+			{HostIP: localHostIP, HostPort: rconHostPort},
 		},
 	}
 
