@@ -4,10 +4,47 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gorcon/rcon"
 )
+
+// execMu serializes Exec calls per target server address, across every
+// rconClient dialed to that address - not just within one instance.
+// Necessary because the underlying gorcon.Conn.Execute isn't safe for
+// concurrent use even on a single connection (no locking around its own
+// write-then-read), and because separate connections to the SAME server
+// aren't safe to use concurrently either: confirmed live against a
+// shared-server RL training run with 4 bots, each with its own separate
+// RCON connection, teleporting concurrently via RCON at the start of
+// each episode - the logged response for one bot's own `tp` command
+// contained OTHER bots' "Teleported X to Y" confirmation text
+// concatenated into it, meaning the server's own command-feedback
+// capture mixed output across commands that were in flight to it at the
+// same time, regardless of which connection carried each one. Keyed by
+// address (not global) so unrelated servers a test suite talks to don't
+// serialize against each other.
+var (
+	execMuMu sync.Mutex
+	execMu   = map[string]*sync.Mutex{}
+)
+
+// execMutexFor returns the shared mutex for addr, creating it on first
+// use. Never removed - the number of distinct addresses a process talks
+// to over its lifetime is small and bounded in practice (one or a
+// handful of test/training servers), not worth the complexity of
+// eviction.
+func execMutexFor(addr string) *sync.Mutex {
+	execMuMu.Lock()
+	defer execMuMu.Unlock()
+	mu, ok := execMu[addr]
+	if !ok {
+		mu = &sync.Mutex{}
+		execMu[addr] = mu
+	}
+	return mu
+}
 
 // RCON abstracts communicating with the server via RCON.
 type RCON interface {
@@ -86,6 +123,14 @@ func (c *rconClient) Reconnect(ctx context.Context) error {
 }
 
 func (c *rconClient) Exec(ctx context.Context, cmd string) (response string, err error) {
+	// Held for the full write-request/read-response round trip below, not
+	// just c.conn.Execute's own call - see execMutexFor's doc comment for
+	// why this needs to serialize across every connection to c.addr, not
+	// just calls on this one rconClient.
+	mu := execMutexFor(c.addr)
+	mu.Lock()
+	defer mu.Unlock()
+
 	defer func() {
 		log.Printf("RCON command response: %s, err: %#v", response, err)
 	}()
