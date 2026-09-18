@@ -467,28 +467,67 @@ func (m *manager) WaitReady_Logger(ctx context.Context, inst *Instance) error {
 	}
 }
 
+// stopGracePeriod is how long Docker waits after SIGTERM before it
+// SIGKILLs a container being stopped. 10s (not the previous 30s): test
+// containers don't need a full graceful Minecraft server shutdown (callers
+// already discard/regenerate world data between runs), and a shorter grace
+// period leaves real headroom below a caller's own context deadline - the
+// previous 30s grace period matched a common 30s caller timeout exactly,
+// so a container that was merely slow (not stuck) to respond to SIGTERM
+// would race the caller's own ctx and report a spurious "context deadline
+// exceeded" even though Docker would have finished stopping it moments
+// later.
+const stopGracePeriod = 10 * time.Second
+
+// orphanFallbackRemoveTimeout bounds the fresh, independent context the
+// removal fallback below uses - never the caller's own ctx, which may
+// already be past its deadline by the time Stop reaches this point (e.g.
+// if the graceful stop above consumed the caller's entire timeout budget).
+// Reusing an already-expired ctx here would fail identically without ever
+// actually attempting removal, defeating the whole point of the fallback.
+const orphanFallbackRemoveTimeout = 15 * time.Second
+
 func (m *manager) Stop(ctx context.Context, inst *Instance, remove bool) error {
-	timeout := 30 * time.Second
-	tVal := int(timeout.Seconds())
-	if stopResult, err := m.cli.ContainerStop(ctx, inst.ID, client.ContainerStopOptions{
+	tVal := int(stopGracePeriod.Seconds())
+	stopResult, err := m.cli.ContainerStop(ctx, inst.ID, client.ContainerStopOptions{
 		Timeout: &tVal,
-	}); err != nil {
-		return fmt.Errorf("container stop: %w", err)
+	})
+	var stopErr error
+	if err != nil {
+		stopErr = fmt.Errorf("container stop: %w", err)
 	} else {
 		fmt.Println("ContainerStop result: ", stopResult)
 	}
 
-	if remove {
-		if removeResult, err := m.cli.ContainerRemove(ctx, inst.ID, client.ContainerRemoveOptions{
-			RemoveVolumes: true,
-			Force:         false,
-		}); err != nil {
-			return fmt.Errorf("container remove: %w", err)
-		} else {
-			fmt.Println("ContainerRemove result: ", removeResult)
-		}
+	if !remove {
+		return stopErr
 	}
-	return nil
+
+	// Always attempt removal, even if the graceful stop above errored or
+	// timed out - a container that's merely slow to respond to SIGTERM (or
+	// whose stop confirmation raced the caller's own context deadline)
+	// still needs to be removed, not left as an orphan for the next test
+	// run to trip over. Force:true makes this work regardless of whether
+	// the container ended up stopped, still running, or somewhere in
+	// between - functionally the same as `docker rm -f`.
+	removeCtx, removeCancel := context.WithTimeout(context.Background(), orphanFallbackRemoveTimeout)
+	defer removeCancel()
+	removeResult, err := m.cli.ContainerRemove(removeCtx, inst.ID, client.ContainerRemoveOptions{
+		RemoveVolumes: true,
+		Force:         true,
+	})
+	if err != nil {
+		if stopErr != nil {
+			return fmt.Errorf("%w (remove also failed: %v)", stopErr, err)
+		}
+		return fmt.Errorf("container remove: %w", err)
+	}
+	fmt.Println("ContainerRemove result: ", removeResult)
+
+	// Report the original stop error even though removal ultimately
+	// succeeded - it's informational (something about the graceful
+	// shutdown path was off) but no longer means the container leaked.
+	return stopErr
 }
 
 func (m *manager) Logs(ctx context.Context, containerID string, opts client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
