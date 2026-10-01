@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -103,6 +104,18 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 		image = "itzg/minecraft-server:latest"
 	}
 
+	host, remote := resolveDaemonHost(m.cli)
+	if remote {
+		// A remote daemon has no access to this machine's filesystem, so a
+		// bind mount here would either fail outright or silently mount the
+		// wrong (or an empty) directory on the remote host. Fail clearly now
+		// rather than let a caller discover this later as a missing-mods or
+		// missing-config test failure with no obvious cause.
+		if cfg.DataDir != "" || cfg.ModsDir != "" || cfg.ConfigDir != "" || cfg.OutputDir != "" || len(cfg.MountDirs) > 0 {
+			return nil, fmt.Errorf("ServerConfig requests local directory binds (DataDir/ModsDir/ConfigDir/OutputDir/MountDirs), but the Docker daemon at %s is remote - these require a daemon with access to this machine's filesystem; unset them, or pre-sync the data to the remote host and reference it with a path valid there, or run against a local daemon", host)
+		}
+	}
+
 	if cfg.PullImage {
 		if err := m.pullImageIfNeeded(ctx, image); err != nil {
 			return nil, fmt.Errorf("pull image: %w", err)
@@ -153,6 +166,19 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 		return nil, err
 	}
 
+	// RCON binds to loopback-only by default - deliberately, since it's an
+	// admin interface and this keeps it off the LAN for the common local-
+	// daemon case. Against a remote daemon, loopback is the *remote*
+	// machine's own loopback, which nothing - including this test runner -
+	// could ever reach, so RCON must bind to all interfaces there instead.
+	// Callers pointing at a remote daemon are already responsible for that
+	// daemon's own network exposure (same as exposing the Docker API itself
+	// remotely); this follows the same tradeoff for RCON specifically.
+	rconHostIP := localHostIP
+	if remote {
+		rconHostIP = allHostIP
+	}
+
 	serverHostPort := ""
 	if cfg.HostServerPort != 0 {
 		serverHostPort = strconv.Itoa(cfg.HostServerPort)
@@ -167,7 +193,7 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 			{HostIP: allHostIP, HostPort: serverHostPort},
 		},
 		rconPort: []network.PortBinding{
-			{HostIP: localHostIP, HostPort: rconHostPort},
+			{HostIP: rconHostIP, HostPort: rconHostPort},
 		},
 	}
 
@@ -255,7 +281,7 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 		ID:             createResp.ID,
 		Name:           name,
 		Version:        cfg.Version,
-		Host:           "127.0.0.1",
+		Host:           host,
 		HostServerPort: hostServerPort,
 		HostRCONPort:   hostRCONPort,
 		RCONPassword:   rconPassword,
@@ -568,6 +594,39 @@ func (m *manager) pullImageIfNeeded(ctx context.Context, image string) error {
 }
 
 // Helpers
+
+// resolveDaemonHost inspects cli's resolved Docker daemon host (whatever
+// client.FromEnv set it to - DOCKER_HOST, or the platform default when
+// unset) and returns the hostname test code should use to reach a
+// container's published ports, plus whether that daemon is non-local.
+//
+// A unix socket or Windows named pipe means the daemon is on this machine -
+// published ports are reachable at 127.0.0.1 regardless of the socket's own
+// path. A tcp/http(s)/ssh host whose hostname is itself localhost/
+// 127.0.0.1/::1 is still local for this purpose too (e.g.
+// DOCKER_HOST=tcp://127.0.0.1:2375, a common way to test against a local
+// daemon over TCP/TLS rather than genuinely pointing elsewhere). Anything
+// else is a genuinely remote daemon, and both the host this function
+// returns and the remote bool it returns matter beyond just this function:
+// see Start's use of remote for RCON's bind address and for rejecting
+// local-filesystem bind mounts that a remote daemon can't honor.
+func resolveDaemonHost(cli *client.Client) (host string, remote bool) {
+	raw := cli.DaemonHost()
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "127.0.0.1", false
+	}
+	switch u.Scheme {
+	case "unix", "npipe", "":
+		return "127.0.0.1", false
+	}
+	switch u.Hostname() {
+	case "", "localhost", "127.0.0.1", "::1":
+		return "127.0.0.1", false
+	default:
+		return u.Hostname(), true
+	}
+}
 
 func boolToString(b bool) string {
 	if b {
