@@ -19,8 +19,9 @@ Module path: `github.com/reallyoldfogie/mc-client-test-go`.
 ## Prerequisites
 
 - Go 1.24+ (or adjust `go.mod` as needed).
-- Docker daemon running locally and accessible via the standard environment
-  (`DOCKER_HOST`, `/var/run/docker.sock`, etc.).
+- Docker daemon running locally (default) or on a remote host reached over SSH (see
+  [Running Against a Remote Docker Host](#running-against-a-remote-docker-host-ssh) below) and
+  accessible via the standard environment (`DOCKER_HOST`, `/var/run/docker.sock`, etc.).
 - Network + resources to run one or more Minecraft servers.
 
 ## Installation
@@ -58,7 +59,15 @@ type ServerConfig struct {
     NamePrefix string            // container name prefix, e.g. "mc-test-"
     MountDirs  []string          // extra directories to mount, each to /data/<val>
 }
+```
 
+> `DataDir`/`ModsDir`/`ConfigDir`/`OutputDir`/`MountDirs` are always *local* paths on the machine
+> running your test, regardless of where the Docker daemon actually is. Against a local daemon
+> they're bind-mounted directly; against an `ssh://` daemon (see below) their contents are synced
+> to the remote host first and the bind-mount source is rewritten to point there — the field
+> itself never changes meaning, only how `Start` gets the data to where the container can see it.
+
+```go
 type Instance struct {
     ID             string
     Name           string
@@ -122,7 +131,10 @@ if err != nil {
 ```
 
 `NewManager` initializes a Docker client using `client.FromEnv` and API
-version negotiation.
+version negotiation — unless `DOCKER_HOST` is an `ssh://` URL, in which case it switches into SSH
+tunnel mode instead (see [Running Against a Remote Docker Host](#running-against-a-remote-docker-host-ssh)).
+Everything from this point on (`Start`, `WaitReady`, `RCONClient`, `Stop`, ...) works identically
+either way — no caller code needs to change based on which mode `NewManager` picked.
 
 ## Starting a Test Server
 
@@ -155,10 +167,16 @@ if err := mgr.WaitReady(ctx, inst); err != nil {
 
 The module maps:
 
-- Container `25565/tcp` (Minecraft) to a random available host port.
-- Container `25575/tcp` (RCON) to a random available host port, bound to `127.0.0.1`.
+- Container `25565/tcp` (Minecraft) to a random available host port, bound to all interfaces.
+- Container `25575/tcp` (RCON) to a random available host port, bound to `127.0.0.1` only — unless
+  the Docker daemon is a genuinely remote one reached *without* an SSH tunnel (plain `tcp://`), in
+  which case RCON binds to all interfaces too, since otherwise nothing (including this library)
+  could ever reach it. See [Running Against a Remote Docker Host](#running-against-a-remote-docker-host-ssh)
+  for why an SSH tunnel avoids that tradeoff.
 
-`Instance.Host` is typically `127.0.0.1`.
+`Instance.Host` is `127.0.0.1` for a local daemon *and* for an SSH-tunneled remote one (the tunnel
+makes the remote container's ports reachable at a local port) — it's only ever the daemon's real
+hostname for a direct, un-tunneled `tcp://` remote daemon.
 
 ## Stopping and Cleaning Up
 
@@ -356,6 +374,76 @@ go test ./... -run TestClientCompatibility -v
 Make sure Docker is running and you have enough resources for the Mojang
 server(s). You can control the number of parallel tests with `-parallel`
 and by limiting the size of your version matrix.
+
+## Running Against a Remote Docker Host (SSH)
+
+Set `DOCKER_HOST` to an `ssh://` URL before calling `NewManager()`, and everything (`Start`,
+`WaitReady`, `RCONClient`, `Stop`, local directory binds) runs against that remote host instead,
+with no other code changes:
+
+```bash
+export DOCKER_HOST="ssh://user@remote-host"       # or just "ssh://remote-host" if your SSH
+                                                    # config/user already resolves it
+go test ./... -run TestClientCompatibility -v
+```
+
+### Why this needs special handling at all
+
+The underlying Docker client this library uses (`github.com/moby/moby/client`) has **no real SSH
+transport** — confirmed directly, not assumed: pointing it at an `ssh://` host makes it attempt a
+plain DNS lookup of the hostname and fail, rather than ever invoking `ssh`. (The full `docker` CLI
+gets SSH support from a separate helper package, `docker/cli/cli/connhelper`, which this library
+doesn't depend on.) So `NewManager` detects an `ssh://` `DOCKER_HOST` itself and handles it
+differently from the start, rather than handing it to the Docker client at all.
+
+### How it works
+
+For each container `Start` creates, when in SSH mode:
+
+1. It opens one real `ssh -N` connection (shelled out to the `ssh` binary already on your PATH)
+   with three local port forwards: the remote Docker daemon's unix socket
+   (`/var/run/docker.sock`), and the container's eventual game-server and RCON ports — the *same*
+   port number is used locally and remotely for the latter two, picked freshly per container, so
+   nothing downstream needs to track "local port X maps to remote port Y" as two different
+   numbers.
+2. The Docker API client for that one container's entire lifecycle is then a perfectly ordinary
+   local `tcp://127.0.0.1:<forwarded-port>` client — talking to the tunnel, not to anything
+   ssh-aware. `Instance.Host` ends up `127.0.0.1` for the same reason local mode does.
+3. If `DataDir`/`ModsDir`/`ConfigDir`/`OutputDir`/`MountDirs` are set, their contents are copied to
+   a per-container staging directory on the remote host (`/tmp/mc-client-test-go-<random>/`) by
+   piping a `tar` archive through a second `ssh` call — chosen over `scp`/`rsync` specifically to
+   avoid a second transfer protocol and `scp`'s well-known trailing-slash "copy contents vs. copy
+   the directory itself" ambiguity. The container's bind-mount source is then the *remote* staged
+   path, not your original local one.
+4. `Stop(ctx, inst, remove: true)` closes the tunnel and removes the remote staging directory
+   (`rm -rf`) once the container itself is confirmed removed — nothing is left running or staged
+   on the remote host afterward. (`remove: false` leaves both alone, since the container may still
+   be inspected or restarted.)
+
+RCON stays bound to the remote host's own loopback in this mode (the tunnel is what provides
+outside access to it) — it is **never** exposed on the remote network, unlike the plain-`tcp://`-remote-daemon
+case described above.
+
+### `MountDirs` and SSH tunnel mode
+
+A local-daemon bind uses each `MountDirs` entry as *both* the host source path and (via
+`/data/<value>`) the destination directory name — which only works if the value is already a bare
+name. Once staged remotely under a per-container root, the source path can no longer double as
+that name, so the destination name is taken from the local path's base name instead
+(`filepath.Base`) — e.g. `MountDirs: []string{"/home/you/testdata/resourcepacks"}` mounts to
+`/data/resourcepacks` either way.
+
+### Requirements
+
+- `ssh` and `tar` available locally (both virtually always present on Linux/macOS).
+- Passwordless, key-based SSH auth already working to the target — this library always passes
+  `BatchMode=yes`, so a target that would otherwise prompt for a password or passphrase fails
+  immediately with a clear error instead of hanging.
+- The SSH user needs access to the remote Docker daemon (typically: in the `docker` group, or
+  root) and (if using local directory binds) write access to create `/tmp/mc-client-test-go-*`.
+- No pre-flight reachability check is done by this library itself — an unreachable host, failed
+  auth, or missing `ssh`/`tar` binary surfaces as a real error from `Start` (wrapped as
+  `"ssh tunnel: ..."`), not a special case you need to handle separately.
 
 ## Notes / Caveats
 

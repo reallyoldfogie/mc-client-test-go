@@ -11,8 +11,10 @@ import (
 	"io"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
@@ -83,16 +85,55 @@ type Manager interface {
 
 type manager struct {
 	cli *client.Client
+
+	// sshTarget, when non-empty, is a DOCKER_HOST=ssh://... value: instead
+	// of (unsuccessfully - the underlying client has no real SSH
+	// transport, see parseSSHDockerHost) handing this to client.New, Start
+	// shells out to open an actual SSH tunnel per container and uses a
+	// plain local tcp:// client through that tunnel instead. cli is unused
+	// (nil) in this mode - every operation is scoped to one tunneled
+	// container via tunnels below.
+	sshTarget string
+
+	// tunnels holds the live sshTunnel for each container ID currently
+	// running behind one, keyed by Instance.ID. Populated by Start once a
+	// container actually exists (not before - there's no ID to key on
+	// yet), consulted by clientForContainer, and removed by Stop once the
+	// tunnel itself is closed.
+	tunnelsMu sync.Mutex
+	tunnels   map[string]*sshTunnel
 }
 
-// NewManager creates a new Manager using the local Docker daemon (DOCKER_HOST, etc).
+// NewManager creates a new Manager using the local Docker daemon
+// (DOCKER_HOST, etc), or - if DOCKER_HOST is an ssh:// URI - a Manager that
+// opens a dedicated SSH tunnel per container it starts (see Start and
+// ssh_tunnel.go) rather than trying to hand that URI to the Docker client
+// directly, which doesn't work: this package's vendored Docker client has
+// no real SSH transport (confirmed directly - it attempts a plain DNS
+// lookup of the host, not an SSH connection), unlike the full docker CLI's
+// separate connhelper package.
 func NewManager() (Manager, error) {
-	cli, err := client.New(client.FromEnv)
+	if target, ok := parseSSHDockerHost(os.Getenv(client.EnvOverrideHost)); ok {
+		return &manager{sshTarget: target, tunnels: map[string]*sshTunnel{}}, nil
+	}
 
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, err
 	}
-	return &manager{cli: cli}, nil
+	return &manager{cli: cli, tunnels: map[string]*sshTunnel{}}, nil
+}
+
+// clientForContainer returns the Docker API client to use for an operation
+// on an already-created container: the per-instance tunneled client if it
+// lives behind an SSH tunnel, or the manager's own client otherwise.
+func (m *manager) clientForContainer(containerID string) *client.Client {
+	m.tunnelsMu.Lock()
+	defer m.tunnelsMu.Unlock()
+	if t, ok := m.tunnels[containerID]; ok {
+		return t.cli
+	}
+	return m.cli
 }
 
 func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error) {
@@ -104,20 +145,110 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 		image = "itzg/minecraft-server:latest"
 	}
 
-	host, remote := resolveDaemonHost(m.cli)
-	if remote {
-		// A remote daemon has no access to this machine's filesystem, so a
-		// bind mount here would either fail outright or silently mount the
-		// wrong (or an empty) directory on the remote host. Fail clearly now
-		// rather than let a caller discover this later as a missing-mods or
-		// missing-config test failure with no obvious cause.
-		if cfg.DataDir != "" || cfg.ModsDir != "" || cfg.ConfigDir != "" || cfg.OutputDir != "" || len(cfg.MountDirs) > 0 {
-			return nil, fmt.Errorf("ServerConfig requests local directory binds (DataDir/ModsDir/ConfigDir/OutputDir/MountDirs), but the Docker daemon at %s is remote - these require a daemon with access to this machine's filesystem; unset them, or pre-sync the data to the remote host and reference it with a path valid there, or run against a local daemon", host)
+	isSSHTunnel := m.sshTarget != ""
+	hasLocalBinds := cfg.DataDir != "" || cfg.ModsDir != "" || cfg.ConfigDir != "" || cfg.OutputDir != "" || len(cfg.MountDirs) > 0
+
+	// cli is resolved once, up front, and used for every Docker API call
+	// this function makes - either the manager's own client, or (in SSH
+	// tunnel mode) a fresh client dedicated to this one container, dialed
+	// through a tunnel opened just below. Nothing past this point should
+	// ever reference m.cli directly.
+	cli := m.cli
+	var tunnel *sshTunnel
+	var closeTunnelOnReturn bool
+	var removeStageOnReturn bool
+	var remoteStageRoot string
+	var extraBinds []string
+	if isSSHTunnel {
+		// cfg.HostServerPort/HostRCONPort are overridden unconditionally
+		// here (even if the caller already set them) - SSH tunnel mode
+		// must control these itself to guarantee the local-forwarded port
+		// and the remote-bound port are the same number (see
+		// startSSHTunnel's doc comment), which a caller-supplied value
+		// could trivially break.
+		var err error
+		cfg.HostServerPort, err = freeLocalPort()
+		if err != nil {
+			return nil, fmt.Errorf("ssh tunnel: %w", err)
+		}
+		cfg.HostRCONPort, err = freeLocalPort()
+		if err != nil {
+			return nil, fmt.Errorf("ssh tunnel: %w", err)
+		}
+		apiPort, err := freeLocalPort()
+		if err != nil {
+			return nil, fmt.Errorf("ssh tunnel: %w", err)
+		}
+
+		tunnel, err = startSSHTunnel(ctx, m.sshTarget, apiPort, cfg.HostServerPort, cfg.HostRCONPort)
+		if err != nil {
+			return nil, fmt.Errorf("ssh tunnel: %w", err)
+		}
+		cli = tunnel.cli
+
+		// Closed on every error return below. Start's final success path
+		// sets this to false and hands ownership to m.tunnels instead, for
+		// Stop to close once the container itself is gone.
+		closeTunnelOnReturn = true
+		defer func() {
+			if closeTunnelOnReturn {
+				_ = tunnel.Close()
+			}
+		}()
+
+		if hasLocalBinds {
+			// A fresh random root per container (not derived from anything
+			// else already computed here) - keeps this independent of
+			// rconPassword/name, which are generated later and shouldn't
+			// need reordering just to feed this.
+			suffix, err := randomHex(8)
+			if err != nil {
+				return nil, fmt.Errorf("ssh tunnel: generate remote stage directory name: %w", err)
+			}
+			remoteStageRoot = "/tmp/mc-client-test-go-" + suffix
+			tunnel.remoteStageDir = remoteStageRoot
+
+			// Removed on every error return from Start from here on (via
+			// the deferred check below, mirroring closeTunnelOnReturn) -
+			// including a failure in the container create/start/inspect
+			// steps that come *after* this block, not just a sync failure
+			// right here. A sync that fails partway through has still
+			// staged *something* on the remote host that needs cleaning
+			// up, not just a cleanly-failed one.
+			removeStageOnReturn = true
+			defer func() {
+				if removeStageOnReturn {
+					_ = removeRemoteDir(context.Background(), m.sshTarget, remoteStageRoot)
+				}
+			}()
+
+			binds, err := syncLocalBindsToRemote(ctx, m.sshTarget, remoteStageRoot, cfg)
+			if err != nil {
+				return nil, fmt.Errorf("ssh tunnel: stage local directories on remote host: %w", err)
+			}
+			extraBinds = binds
+
+			// The generic per-field bind-building code below must not also
+			// try to bind these fields' *original* local paths directly -
+			// extraBinds (built from the remote-staged paths instead)
+			// already covers them.
+			cfg.DataDir, cfg.ModsDir, cfg.ConfigDir, cfg.OutputDir, cfg.MountDirs = "", "", "", "", nil
 		}
 	}
 
+	host, apiRemote := resolveDaemonHost(cli)
+	// Same local-filesystem problem as the SSH-tunnel check above, for a
+	// daemon reached directly over tcp:// with no tunnel involved (where
+	// isSSHTunnel is false but the daemon is still remote - resolveDaemonHost
+	// is what actually knows that here; a tunneled client's DaemonHost() is
+	// its own local endpoint, so this check correctly leaves it alone -
+	// already handled, before any tunnel was even opened, above).
+	if apiRemote && hasLocalBinds {
+		return nil, fmt.Errorf("ServerConfig requests local directory binds (DataDir/ModsDir/ConfigDir/OutputDir/MountDirs), but the Docker daemon at %s is remote - these require a daemon with access to this machine's filesystem; unset them, or pre-sync the data to the remote host and reference it with a path valid there, or run against a local daemon", host)
+	}
+
 	if cfg.PullImage {
-		if err := m.pullImageIfNeeded(ctx, image); err != nil {
+		if err := pullImageIfNeeded(ctx, cli, image); err != nil {
 			return nil, fmt.Errorf("pull image: %w", err)
 		}
 	}
@@ -168,14 +299,21 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 
 	// RCON binds to loopback-only by default - deliberately, since it's an
 	// admin interface and this keeps it off the LAN for the common local-
-	// daemon case. Against a remote daemon, loopback is the *remote*
-	// machine's own loopback, which nothing - including this test runner -
-	// could ever reach, so RCON must bind to all interfaces there instead.
-	// Callers pointing at a remote daemon are already responsible for that
-	// daemon's own network exposure (same as exposing the Docker API itself
-	// remotely); this follows the same tradeoff for RCON specifically.
+	// daemon case. Against a directly-reached remote daemon (plain tcp://,
+	// no tunnel), loopback is the *remote* machine's own loopback, which
+	// nothing - including this test runner - could ever reach, so RCON
+	// must bind to all interfaces there instead. Callers pointing at a
+	// remote daemon that way are already responsible for that daemon's own
+	// network exposure (same as exposing the Docker API itself remotely);
+	// this follows the same tradeoff for RCON specifically.
+	//
+	// An SSH tunnel is different: it already provides the remote access
+	// path by forwarding to the remote host's own loopback (see
+	// ssh_tunnel.go), so RCON staying loopback-only there is both correct
+	// and strictly better - it's never exposed beyond the tunnel itself,
+	// not even password-protected-but-open on the remote LAN.
 	rconHostIP := localHostIP
-	if remote {
+	if apiRemote && !isSSHTunnel {
 		rconHostIP = allHostIP
 	}
 
@@ -224,6 +362,11 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 	for _, mount := range cfg.MountDirs {
 		hostCfg.Binds = append(hostCfg.Binds, fmt.Sprintf("%s:/data/%s", mount, mount))
 	}
+	// extraBinds (SSH tunnel mode only, populated above when hasLocalBinds)
+	// already uses remote-staged paths for exactly the fields the generic
+	// per-field code above would otherwise have handled - they were
+	// cleared on cfg before reaching any of it, so there's no overlap.
+	hostCfg.Binds = append(hostCfg.Binds, extraBinds...)
 
 	name := cfg.NamePrefix + "mc-" + strings.ReplaceAll(cfg.Version, ".", "-") +
 		"-" + strings.ToLower(mustShortID(rconPassword))
@@ -240,7 +383,7 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 		Name:       name,
 	}
 
-	createResp, err := m.cli.ContainerCreate(
+	createResp, err := cli.ContainerCreate(
 		ctx,
 		createOptions,
 	)
@@ -248,32 +391,48 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 		return nil, fmt.Errorf("container create: %w", err)
 	}
 
-	if containerStartResult, err := m.cli.ContainerStart(ctx, createResp.ID, client.ContainerStartOptions{}); err != nil {
+	// From here on, a failure must still clean up the now-created container
+	// (and, in SSH tunnel mode, the tunnel) rather than leaking it the way a
+	// bare early return would - mirrors Stop's own "always attempt removal"
+	// philosophy, just applied to a container that never finished starting.
+	cleanupOnFailure := func() {
+		removeCtx, cancel := context.WithTimeout(context.Background(), orphanFallbackRemoveTimeout)
+		defer cancel()
+		_, _ = cli.ContainerRemove(removeCtx, createResp.ID, client.ContainerRemoveOptions{RemoveVolumes: true, Force: true})
+	}
+
+	if containerStartResult, err := cli.ContainerStart(ctx, createResp.ID, client.ContainerStartOptions{}); err != nil {
+		cleanupOnFailure()
 		return nil, fmt.Errorf("container start: %w", err)
 	} else {
 		fmt.Println("ContainerStart result: ", containerStartResult)
 	}
 
-	containerInspectResult, err := m.cli.ContainerInspect(ctx, createResp.ID, client.ContainerInspectOptions{})
+	containerInspectResult, err := cli.ContainerInspect(ctx, createResp.ID, client.ContainerInspectOptions{})
 	if err != nil {
+		cleanupOnFailure()
 		return nil, fmt.Errorf("container inspect: %w", err)
 	}
 
 	serverBindings := containerInspectResult.Container.NetworkSettings.Ports[serverPort]
 	if len(serverBindings) == 0 {
+		cleanupOnFailure()
 		return nil, fmt.Errorf("no host port mapped for %s", serverPort)
 	}
 	rconBindings := containerInspectResult.Container.NetworkSettings.Ports[rconPort]
 	if len(rconBindings) == 0 {
+		cleanupOnFailure()
 		return nil, fmt.Errorf("no host port mapped for %s", rconPort)
 	}
 
 	hostServerPort, err := strconv.Atoi(serverBindings[0].HostPort)
 	if err != nil {
+		cleanupOnFailure()
 		return nil, fmt.Errorf("parse host server port: %w", err)
 	}
 	hostRCONPort, err := strconv.Atoi(rconBindings[0].HostPort)
 	if err != nil {
+		cleanupOnFailure()
 		return nil, fmt.Errorf("parse host RCON port: %w", err)
 	}
 
@@ -285,6 +444,18 @@ func (m *manager) Start(ctx context.Context, cfg ServerConfig) (*Instance, error
 		HostServerPort: hostServerPort,
 		HostRCONPort:   hostRCONPort,
 		RCONPassword:   rconPassword,
+	}
+
+	if isSSHTunnel {
+		// Success: the tunnel (and any remote-staged directories) are no
+		// longer this function's to clean up - they now belong to this
+		// instance for as long as the container lives, and Stop is what
+		// closes/removes them (remoteStageDir, carried on tunnel itself).
+		closeTunnelOnReturn = false
+		removeStageOnReturn = false
+		m.tunnelsMu.Lock()
+		m.tunnels[createResp.ID] = tunnel
+		m.tunnelsMu.Unlock()
 	}
 
 	return inst, nil
@@ -386,7 +557,7 @@ type containerState struct {
 
 // getContainerState retrieves the current container state
 func (m *manager) getContainerState(ctx context.Context, containerID string) (*containerState, error) {
-	inspect, err := m.cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	inspect, err := m.clientForContainer(containerID).ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("inspect container: %w", err)
 	}
@@ -514,8 +685,10 @@ const stopGracePeriod = 10 * time.Second
 const orphanFallbackRemoveTimeout = 15 * time.Second
 
 func (m *manager) Stop(ctx context.Context, inst *Instance, remove bool) error {
+	cli := m.clientForContainer(inst.ID)
+
 	tVal := int(stopGracePeriod.Seconds())
-	stopResult, err := m.cli.ContainerStop(ctx, inst.ID, client.ContainerStopOptions{
+	stopResult, err := cli.ContainerStop(ctx, inst.ID, client.ContainerStopOptions{
 		Timeout: &tVal,
 	})
 	var stopErr error
@@ -526,6 +699,9 @@ func (m *manager) Stop(ctx context.Context, inst *Instance, remove bool) error {
 	}
 
 	if !remove {
+		// The container (and, if it has one, its SSH tunnel) may still be
+		// inspected/restarted/logged by a later call, so neither is torn
+		// down here - only a remove=true Stop means "done with this one".
 		return stopErr
 	}
 
@@ -538,10 +714,29 @@ func (m *manager) Stop(ctx context.Context, inst *Instance, remove bool) error {
 	// between - functionally the same as `docker rm -f`.
 	removeCtx, removeCancel := context.WithTimeout(context.Background(), orphanFallbackRemoveTimeout)
 	defer removeCancel()
-	removeResult, err := m.cli.ContainerRemove(removeCtx, inst.ID, client.ContainerRemoveOptions{
+	removeResult, err := cli.ContainerRemove(removeCtx, inst.ID, client.ContainerRemoveOptions{
 		RemoveVolumes: true,
 		Force:         true,
 	})
+
+	// Close and forget this container's SSH tunnel (if any) regardless of
+	// how removal went - a remove=true Stop means the caller is done with
+	// this container either way, and the exact same orphaned-process risk
+	// that motivated Start's own "always clean up on failure" applies here
+	// to the tunnel's ssh subprocess, not just the container.
+	m.tunnelsMu.Lock()
+	tunnel, hadTunnel := m.tunnels[inst.ID]
+	delete(m.tunnels, inst.ID)
+	m.tunnelsMu.Unlock()
+	if hadTunnel {
+		_ = tunnel.Close()
+		if tunnel.remoteStageDir != "" {
+			stageCtx, stageCancel := context.WithTimeout(context.Background(), orphanFallbackRemoveTimeout)
+			_ = removeRemoteDir(stageCtx, m.sshTarget, tunnel.remoteStageDir)
+			stageCancel()
+		}
+	}
+
 	if err != nil {
 		if stopErr != nil {
 			return fmt.Errorf("%w (remove also failed: %v)", stopErr, err)
@@ -557,7 +752,7 @@ func (m *manager) Stop(ctx context.Context, inst *Instance, remove bool) error {
 }
 
 func (m *manager) Logs(ctx context.Context, containerID string, opts client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
-	reader, err := m.cli.ContainerLogs(ctx, containerID, opts)
+	reader, err := m.clientForContainer(containerID).ContainerLogs(ctx, containerID, opts)
 	if err != nil {
 		return nil, fmt.Errorf("container logs: %w", err)
 	}
@@ -569,13 +764,17 @@ func (m *manager) RCONClient(ctx context.Context, inst *Instance) (RCON, error) 
 	return newRCONClient(ctx, inst.Host, inst.HostRCONPort, inst.RCONPassword)
 }
 
-// pullImageIfNeeded pulls the image if it is not already present (or always if PullImage is true).
-func (m *manager) pullImageIfNeeded(ctx context.Context, image string) error {
+// pullImageIfNeeded pulls image via cli if it is not already present on
+// whichever daemon cli talks to (not a method on *manager: Start resolves
+// cli itself - m.cli, or a per-instance tunneled client - before this is
+// ever called, and it must use exactly that client, not reach past it back
+// to m.cli).
+func pullImageIfNeeded(ctx context.Context, cli *client.Client, image string) error {
 	filters := client.Filters{}
 	filters.Add("reference", image)
 
 	// Quick check if image exists locally
-	imageListResult, err := m.cli.ImageList(ctx, client.ImageListOptions{
+	imageListResult, err := cli.ImageList(ctx, client.ImageListOptions{
 		Filters: filters,
 	})
 	if err == nil && len(imageListResult.Items) > 0 {
@@ -583,7 +782,7 @@ func (m *manager) pullImageIfNeeded(ctx context.Context, image string) error {
 		return nil
 	}
 
-	rc, err := m.cli.ImagePull(ctx, image, client.ImagePullOptions{})
+	rc, err := cli.ImagePull(ctx, image, client.ImagePullOptions{})
 	if err != nil {
 		return err
 	}
